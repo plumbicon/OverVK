@@ -1,0 +1,17 @@
+[Unit]
+Description=FCK-Whitelist VK Tunnel Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/var/fck-whitelist-server
+ExecStart=/var/fck-whitelist-server/venv/bin/python3 /var/fck-whitelist-server/server.py --verbose
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
