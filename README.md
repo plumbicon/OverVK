@@ -17,7 +17,7 @@
 - `config.py`: Загрузка конфигурации (токены VK API, ID групп и чатов) из переменных окружения.
 - `constants.py`: Определение различных констант для протокола, производительности и сервера SOCKS5.
 - `requirements.txt`: Зависимости проекта.
-- `fck-whitelist.service`: Пример systemd сервиса для запуска сервера в фоне.
+- `overvk.service`: Пример systemd сервиса для запуска сервера в фоне.
 
 ## Настройка
 
@@ -54,21 +54,64 @@ pip install -r requirements.txt
 
 ## Использование
 
+### Запуск вручную
+
 1.  **Запустите сервер** на вашей удаленной машине:
     ```bash
     python3 server.py
     ```
-    Рекомендуется настроить его как `systemd` сервис для работы в фоне (см. `fck-whitelist.service`).
 
 2.  **Запустите клиент** на вашей локальной машине:
     ```bash
     python3 client.py
     ```
 
-3.  **Настройте ваш браузер/ОС:**
-    - Установите прокси-сервер на **SOCKS5**.
-    - **Хост:** `127.0.0.1`
-    - **Порт:** `8888`
+### Настройка systemd сервиса (для сервера)
+
+Для автоматического запуска сервера в фоновом режиме на Linux-системах с `systemd` выполните следующие шаги:
+
+1.  **Скопируйте файлы сервера** на вашу удаленную машину. Предположим, вы разместили их в `/var/overvk-server`:
+    ```bash
+    sudo mkdir -p /var/overvk-server
+    sudo cp server.py app_logic.py protocol.py vk_api.py chat_rotator.py config.py constants.py requirements.txt .env /var/overvk-server/
+    ```
+
+2.  **Создайте виртуальное окружение** и установите зависимости:
+    ```bash
+    sudo python3 -m venv /var/overvk-server/venv
+    sudo /var/overvk-server/venv/bin/pip install -r /var/overvk-server/requirements.txt
+    ```
+
+3.  **Скопируйте сервис-файл** в директорию `systemd`:
+    ```bash
+    sudo cp overvk.service /etc/systemd/system/overvk.service
+    ```
+
+4.  **Перезагрузите `systemd`** для обнаружения нового сервиса:
+    ```bash
+    sudo systemctl daemon-reload
+    ```
+
+5.  **Запустите сервис:**
+    ```bash
+    sudo systemctl start overvk.service
+    ```
+
+6.  **Включите автозапуск** сервиса при загрузке системы:
+    ```bash
+    sudo systemctl enable overvk.service
+    ```
+
+7.  **Проверить статус сервиса** можно командой:
+    ```bash
+    sudo systemctl status overvk.service
+    ```
+
+### Настройка клиента
+
+- Установите прокси-сервер на **SOCKS5**.
+- **Хост:** `127.0.0.1`
+- **Порт:** `8888`
 
 ---
 

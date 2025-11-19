@@ -1,0 +1,17 @@
+[Unit]
+Description=OverVK Tunnel Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/var/overvk-server
+ExecStart=/var/overvk-server/venv/bin/python3 /var/overvk-server/server.py --verbose
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
