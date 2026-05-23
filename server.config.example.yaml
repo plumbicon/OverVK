@@ -1,0 +1,23 @@
+mode: server
+token: <server-community-token>
+group: 987654321
+handshake_phrase: "/overvk-peer"
+verbose: false
+
+engine:
+  sender_workers: 16
+  sender_queue_size: 1000
+  max_chunk_size: 1048576
+  chunk_timeout: 150ms
+  max_text_message_payload: 3000
+  text_message_threshold: 6144
+  upload_url_cache_ttl: 5m
+  max_packet_buffer_size: 100
+  packet_buffer_timeout: 30s
+  http_timeout: 90s
+  long_poll_wait: 25
+  long_poll_delay: 5s
+  bootstrap_peer_scan_limit: 500
+  bootstrap_collect_timeout: 3s
+  enable_session_statistics: true
+  api_version: "5.131"

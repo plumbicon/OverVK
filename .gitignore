@@ -1,0 +1,11 @@
+# Secrets
+GEMINI.md
+config/
+
+# Python
+__pycache__/
+*.pyc
+
+# Go
+bin/
+/overvk
