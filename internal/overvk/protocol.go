@@ -63,8 +63,26 @@ func UploadAndSendChunk(ctx context.Context, client *http.Client, accessToken st
 
 	log.Printf("[%s] Sending %d bytes as DOCUMENT (seq %d)", sessionID, len(data), sequence)
 	if err := sendAsDocument(ctx, client, accessToken, chatPeerID, to, sessionID, sequence, data); err != nil {
-		metric.RecordSend(len(data), false, 1, false)
-		return err
+		log.Printf("[%s] Document upload failed for seq %d, falling back to TEXT: %v", sessionID, sequence, err)
+		numParts := (len(data) + engine.MaxTextMessagePayload - 1) / engine.MaxTextMessagePayload
+		if numParts == 0 {
+			numParts = 1
+		}
+		log.Printf("[%s] Fallback: sending %d bytes as %d TEXT message(s) (seq %d)", sessionID, len(data), numParts, sequence)
+		for partIndex := 0; partIndex < numParts; partIndex++ {
+			start := partIndex * engine.MaxTextMessagePayload
+			end := start + engine.MaxTextMessagePayload
+			if end > len(data) {
+				end = len(data)
+			}
+			if err := sendAsTextMessage(ctx, client, accessToken, chatPeerID, to, sessionID, sequence, data[start:end], partIndex, numParts); err != nil {
+				metric.RecordSend(len(data), true, numParts, false)
+				return err
+			}
+		}
+		metric.RecordSend(len(data), true, numParts, true)
+		metric.RecordLatency(time.Since(started))
+		return nil
 	}
 	metric.RecordSend(len(data), false, 1, true)
 	metric.RecordLatency(time.Since(started))
@@ -104,43 +122,59 @@ func sendAsTextMessage(ctx context.Context, client *http.Client, accessToken str
 }
 
 func sendAsDocument(ctx context.Context, client *http.Client, accessToken string, chatPeerID int, to Target, sessionID string, sequence int, data []byte) error {
-	uploadURL, err := getUploadURL(ctx, client, accessToken, chatPeerID, sessionID)
-	if err != nil {
-		return err
+	const maxUploadRetries = 3
+	var lastErr error
+
+	for attempt := 0; attempt < maxUploadRetries; attempt++ {
+		if attempt > 0 {
+			invalidateUploadURL(accessToken, chatPeerID)
+			log.Printf("[%s] Retrying document upload seq=%d (attempt %d/%d)", sessionID, sequence, attempt+1, maxUploadRetries)
+		}
+
+		uploadURL, err := getUploadURL(ctx, client, accessToken, chatPeerID, sessionID)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		uploadResult, err := uploadDocument(ctx, client, uploadURL, data)
+		if err != nil {
+			invalidateUploadURL(accessToken, chatPeerID)
+			lastErr = err
+			continue
+		}
+
+		fileValue := stringFromAny(uploadResult["file"])
+		if fileValue == "" {
+			invalidateUploadURL(accessToken, chatPeerID)
+			lastErr = fmt.Errorf("[%s] VK upload response did not contain file field", sessionID)
+			continue
+		}
+
+		saveResp, err := APICall(ctx, client, "docs.save", url.Values{"file": {fileValue}}, accessToken)
+		if err != nil {
+			lastErr = fmt.Errorf("[%s] docs.save failed: %w", sessionID, err)
+			continue
+		}
+		attachment, err := documentAttachmentString(saveResp)
+		if err != nil {
+			return fmt.Errorf("[%s] parse docs.save response: %w", sessionID, err)
+		}
+
+		headerBlock := buildHeaderBlock(to, MessageData, sessionID, sequence, "")
+		_, err = APICall(ctx, client, "messages.send", url.Values{
+			"peer_id":    {strconv.Itoa(chatPeerID)},
+			"message":    {headerBlock},
+			"attachment": {attachment},
+			"random_id":  {randomID()},
+		}, accessToken)
+		if err != nil {
+			return fmt.Errorf("[%s] send document message seq=%d: %w", sessionID, sequence, err)
+		}
+		return nil
 	}
 
-	uploadResult, err := uploadDocument(ctx, client, uploadURL, data)
-	if err != nil {
-		invalidateUploadURL(accessToken, chatPeerID)
-		return err
-	}
-
-	fileValue := stringFromAny(uploadResult["file"])
-	if fileValue == "" {
-		invalidateUploadURL(accessToken, chatPeerID)
-		return fmt.Errorf("[%s] VK upload response did not contain file field", sessionID)
-	}
-
-	saveResp, err := APICall(ctx, client, "docs.save", url.Values{"file": {fileValue}}, accessToken)
-	if err != nil {
-		return fmt.Errorf("[%s] docs.save failed: %w", sessionID, err)
-	}
-	attachment, err := documentAttachmentString(saveResp)
-	if err != nil {
-		return fmt.Errorf("[%s] parse docs.save response: %w", sessionID, err)
-	}
-
-	headerBlock := buildHeaderBlock(to, MessageData, sessionID, sequence, "")
-	_, err = APICall(ctx, client, "messages.send", url.Values{
-		"peer_id":    {strconv.Itoa(chatPeerID)},
-		"message":    {headerBlock},
-		"attachment": {attachment},
-		"random_id":  {randomID()},
-	}, accessToken)
-	if err != nil {
-		return fmt.Errorf("[%s] send document message seq=%d: %w", sessionID, sequence, err)
-	}
-	return nil
+	return lastErr
 }
 
 func getUploadURL(ctx context.Context, client *http.Client, accessToken string, chatPeerID int, sessionID string) (string, error) {
