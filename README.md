@@ -40,6 +40,7 @@ mode: server
 ```yaml
 mode: client
 token: <client-community-token>
+key: "shared-secret"
 group: 123456789
 handshake_phrase: "/overvk-peer"
 verbose: false
@@ -51,7 +52,6 @@ engine:
   sender_queue_size: 1000
   max_chunk_size: 1048576
   chunk_timeout: 150ms
-  max_text_message_payload: 3000
   text_message_threshold: 6144
   upload_url_cache_ttl: 5m
   max_packet_buffer_size: 100
@@ -77,6 +77,7 @@ engine:
 ```yaml
 mode: server
 token: <server-community-token>
+key: "shared-secret"
 group: 987654321
 handshake_phrase: "/overvk-peer"
 verbose: false
@@ -86,7 +87,6 @@ engine:
   sender_queue_size: 1000
   max_chunk_size: 1048576
   chunk_timeout: 150ms
-  max_text_message_payload: 3000
   text_message_threshold: 6144
   upload_url_cache_ttl: 5m
   max_packet_buffer_size: 100
@@ -101,6 +101,22 @@ engine:
 ```
 
 Все поля `engine` опциональны. Если поле не указано, используется значение по умолчанию.
+
+## Шифрование
+
+Если в конфиге задан `key`, все VK-сообщения шифруются AES-256-GCM. Шифруется всё содержимое сообщения целиком, включая служебные заголовки протокола (`To`, `Type`, `SessionID`, `MessageID`), что делает трафик неотличимым от случайных данных для стороннего наблюдателя.
+
+Ключ должен совпадать на клиенте и сервере. Из переданной строки выводится 256-битный ключ через SHA-256.
+
+Генерация секрета:
+
+```bash
+openssl rand -base64 32
+```
+
+Если `key` не задан, шифрование отключено и протокол работает в открытом виде (обратная совместимость).
+
+Документы (крупные чанки) шифруются отдельно: заголовочный блок сообщения и содержимое файла шифруются независимо.
 
 ## Bootstrap бесед
 
@@ -164,7 +180,8 @@ journalctl -u overvk.service -f
 - небольшие чанки кодируются в Base64 и отправляются текстовыми сообщениями;
 - крупные чанки отправляются как VK-документы;
 - сообщения получают `SessionID`, `MessageID`, направление и тип;
-- принимающая сторона восстанавливает порядок пакетов и пишет данные в TCP-сокет.
+- при включённом шифровании всё содержимое каждого сообщения шифруется AES-256-GCM;
+- принимающая сторона дешифрует, восстанавливает порядок пакетов и пишет данные в TCP-сокет.
 
 Сервер слушает Long Poll своего сообщества, получает команды клиента, открывает TCP-соединение к целевому хосту и возвращает ответ клиенту тем же протоколом.
 

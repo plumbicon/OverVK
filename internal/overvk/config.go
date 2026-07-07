@@ -21,6 +21,7 @@ const (
 type RuntimeConfig struct {
 	Mode            RuntimeMode
 	Token           string
+	Key             string
 	GroupID         int
 	PeerIDs         []int
 	HandshakePhrase string
@@ -31,6 +32,7 @@ type RuntimeConfig struct {
 type rawConfig struct {
 	Mode            RuntimeMode     `yaml:"mode"`
 	Token           string          `yaml:"token"`
+	Key             string          `yaml:"key"`
 	GroupID         int             `yaml:"group"`
 	HandshakePhrase string          `yaml:"handshake_phrase"`
 	DiscoveryPhrase string          `yaml:"discovery_phrase"`
@@ -43,9 +45,8 @@ type rawEngineConfig struct {
 	MaxChunkSize            int    `yaml:"max_chunk_size"`
 	ChunkTimeout            string `yaml:"chunk_timeout"`
 	SenderWorkers           int    `yaml:"sender_workers"`
-	VKMessageMaxLength      int    `yaml:"vk_message_max_length"`
-	MaxTextMessagePayload   int    `yaml:"max_text_message_payload"`
-	TextMessageThreshold    int    `yaml:"text_message_threshold"`
+	VKMessageMaxLength    int    `yaml:"vk_message_max_length"`
+	TextMessageThreshold  int    `yaml:"text_message_threshold"`
 	UploadURLCacheTTL       string `yaml:"upload_url_cache_ttl"`
 	MaxPacketBufferSize     int    `yaml:"max_packet_buffer_size"`
 	PacketBufferTimeout     string `yaml:"packet_buffer_timeout"`
@@ -88,6 +89,7 @@ func LoadRuntimeConfig(path string) (RuntimeConfig, error) {
 	config := RuntimeConfig{
 		Mode:            raw.Mode,
 		Token:           strings.TrimSpace(raw.Token),
+		Key:             strings.TrimSpace(raw.Key),
 		GroupID:         raw.GroupID,
 		HandshakePhrase: handshakePhrase,
 		Verbose:         raw.Verbose,
@@ -138,9 +140,6 @@ func (raw rawEngineConfig) withDefaults() (EngineConfig, error) {
 	}
 	if raw.VKMessageMaxLength > 0 {
 		engine.VKMessageMaxLength = raw.VKMessageMaxLength
-	}
-	if raw.MaxTextMessagePayload > 0 {
-		engine.MaxTextMessagePayload = raw.MaxTextMessagePayload
 	}
 	if raw.TextMessageThreshold > 0 {
 		engine.TextMessageThreshold = raw.TextMessageThreshold

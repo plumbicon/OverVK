@@ -71,6 +71,12 @@ func main() {
 		log.Fatalf("configuration error: %v", err)
 	}
 	overvk.ConfigureEngine(config.Engine)
+	if err := overvk.ConfigureCipher(config.Key); err != nil {
+		log.Fatalf("encryption setup failed: %v", err)
+	}
+	if config.Key != "" {
+		log.Println("Encryption enabled (AES-256-GCM)")
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

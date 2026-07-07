@@ -36,21 +36,36 @@ var (
 	uploadGeneration uint64
 )
 
+const headerOverhead = 80 // To + Type + SessionID + MessageID + Part + separator
+
+func maxTextPayload(engine EngineConfig) int {
+	maxChars := engine.VKMessageMaxLength
+	if CipherEnabled() {
+		// outer base64(encrypt(...)) ≤ maxChars
+		maxCipher := maxChars * 3 / 4
+		maxChars = maxCipher - 28 // 12 nonce + 16 GCM tag
+	}
+	maxBase64Payload := maxChars - headerOverhead
+	return maxBase64Payload * 3 / 4
+}
+
 func UploadAndSendChunk(ctx context.Context, client *http.Client, accessToken string, chatPeerID int, to Target, sessionID string, sequence int, data []byte) error {
 	metric := GetSessionMetrics(sessionID)
 	started := time.Now()
 	engine := Engine()
 	isText := len(data) <= engine.TextMessageThreshold
 
+	maxPayload := maxTextPayload(engine)
+
 	if isText {
-		numParts := (len(data) + engine.MaxTextMessagePayload - 1) / engine.MaxTextMessagePayload
+		numParts := (len(data) + maxPayload - 1) / maxPayload
 		if numParts == 0 {
 			numParts = 1
 		}
 		log.Printf("[%s] Sending %d bytes as %d TEXT message(s) (seq %d)", sessionID, len(data), numParts, sequence)
 		for partIndex := 0; partIndex < numParts; partIndex++ {
-			start := partIndex * engine.MaxTextMessagePayload
-			end := start + engine.MaxTextMessagePayload
+			start := partIndex * maxPayload
+			end := start + maxPayload
 			if end > len(data) {
 				end = len(data)
 			}
@@ -67,14 +82,14 @@ func UploadAndSendChunk(ctx context.Context, client *http.Client, accessToken st
 	log.Printf("[%s] Sending %d bytes as DOCUMENT (seq %d)", sessionID, len(data), sequence)
 	if err := sendAsDocument(ctx, client, accessToken, chatPeerID, to, sessionID, sequence, data); err != nil {
 		log.Printf("[%s] Document upload failed for seq %d, falling back to TEXT: %v", sessionID, sequence, err)
-		numParts := (len(data) + engine.MaxTextMessagePayload - 1) / engine.MaxTextMessagePayload
+		numParts := (len(data) + maxPayload - 1) / maxPayload
 		if numParts == 0 {
 			numParts = 1
 		}
 		log.Printf("[%s] Fallback: sending %d bytes as %d TEXT message(s) (seq %d)", sessionID, len(data), numParts, sequence)
 		for partIndex := 0; partIndex < numParts; partIndex++ {
-			start := partIndex * engine.MaxTextMessagePayload
-			end := start + engine.MaxTextMessagePayload
+			start := partIndex * maxPayload
+			end := start + maxPayload
 			if end > len(data) {
 				end = len(data)
 			}
@@ -93,8 +108,11 @@ func UploadAndSendChunk(ctx context.Context, client *http.Client, accessToken st
 }
 
 func SendControlMessage(ctx context.Context, client *http.Client, accessToken string, chatPeerID int, to Target, msgType MessageType, sessionID string, sequence int, payload string) error {
-	message := buildMessage(to, msgType, sessionID, sequence, payload, "")
-	_, err := APICall(ctx, client, "messages.send", url.Values{
+	message, err := EncryptMessageText(buildMessage(to, msgType, sessionID, sequence, payload, ""))
+	if err != nil {
+		return fmt.Errorf("encrypt control message %s for session %s: %w", msgType, sessionID, err)
+	}
+	_, err = APICall(ctx, client, "messages.send", url.Values{
 		"peer_id":   {strconv.Itoa(chatPeerID)},
 		"message":   {message},
 		"random_id": {randomID()},
@@ -111,9 +129,12 @@ func sendAsTextMessage(ctx context.Context, client *http.Client, accessToken str
 		partHeader = fmt.Sprintf("Part: %d/%d\n", partIndex, totalParts)
 	}
 	payload := base64.StdEncoding.EncodeToString(data)
-	message := buildMessage(to, MessageData, sessionID, sequence, payload, partHeader)
+	message, err := EncryptMessageText(buildMessage(to, MessageData, sessionID, sequence, payload, partHeader))
+	if err != nil {
+		return fmt.Errorf("[%s] encrypt text message seq=%d part=%d/%d: %w", sessionID, sequence, partIndex, totalParts, err)
+	}
 
-	_, err := APICall(ctx, client, "messages.send", url.Values{
+	_, err = APICall(ctx, client, "messages.send", url.Values{
 		"peer_id":   {strconv.Itoa(chatPeerID)},
 		"message":   {message},
 		"random_id": {randomID()},
@@ -142,7 +163,13 @@ func sendAsDocument(ctx context.Context, client *http.Client, accessToken string
 		}
 		lastGeneration = gen
 
-		uploadResult, err := uploadDocument(ctx, client, uploadURL, data)
+		encData, err := Encrypt(data)
+		if err != nil {
+			lastErr = fmt.Errorf("[%s] encrypt document data: %w", sessionID, err)
+			continue
+		}
+
+		uploadResult, err := uploadDocument(ctx, client, uploadURL, encData)
 		if err != nil {
 			lastErr = err
 			continue
@@ -164,7 +191,10 @@ func sendAsDocument(ctx context.Context, client *http.Client, accessToken string
 			return fmt.Errorf("[%s] parse docs.save response: %w", sessionID, err)
 		}
 
-		headerBlock := buildHeaderBlock(to, MessageData, sessionID, sequence, "")
+		headerBlock, err := EncryptMessageText(buildHeaderBlock(to, MessageData, sessionID, sequence, ""))
+		if err != nil {
+			return fmt.Errorf("[%s] encrypt document header: %w", sessionID, err)
+		}
 		_, err = APICall(ctx, client, "messages.send", url.Values{
 			"peer_id":    {strconv.Itoa(chatPeerID)},
 			"message":    {headerBlock},
@@ -289,6 +319,9 @@ func documentAttachmentString(saveResp map[string]any) (string, error) {
 
 func ParseMessage(message vkMessage) ParsedMessage {
 	messageText := message.Text
+	if decrypted, err := DecryptMessageText(messageText); err == nil {
+		messageText = decrypted
+	}
 	headerBlock := messageText
 	payload := ""
 	if before, after, ok := strings.Cut(messageText, "\n\n"); ok {
@@ -364,6 +397,7 @@ func ProcessDataMessage(ctx context.Context, client *http.Client, message Parsed
 
 func extractDataPayload(ctx context.Context, client *http.Client, message ParsedMessage) ([]byte, error) {
 	sessionID := message.Headers["SessionID"]
+
 	if message.Attachment != nil {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, message.Attachment.URL, nil)
 		if err != nil {
@@ -377,7 +411,11 @@ func extractDataPayload(ctx context.Context, client *http.Client, message Parsed
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			return nil, fmt.Errorf("[%s] document download returned HTTP %d", sessionID, resp.StatusCode)
 		}
-		return io.ReadAll(resp.Body)
+		raw, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, err
+		}
+		return Decrypt(raw)
 	}
 
 	if message.Payload == "" {

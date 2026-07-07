@@ -14,9 +14,8 @@ type EngineConfig struct {
 	MaxChunkSize            int
 	ChunkTimeout            time.Duration
 	SenderWorkers           int
-	VKMessageMaxLength      int
-	MaxTextMessagePayload   int
-	TextMessageThreshold    int
+	VKMessageMaxLength    int
+	TextMessageThreshold  int
 	UploadURLCacheTTL       time.Duration
 	MaxPacketBufferSize     int
 	PacketBufferTimeout     time.Duration
@@ -38,9 +37,8 @@ func DefaultEngineConfig() EngineConfig {
 		MaxChunkSize:            1024 * 1024,
 		ChunkTimeout:            20 * time.Millisecond,
 		SenderWorkers:           16,
-		VKMessageMaxLength:      4096,
-		MaxTextMessagePayload:   2952,
-		TextMessageThreshold:    8 * 1024,
+		VKMessageMaxLength:    4096,
+		TextMessageThreshold:  8 * 1024,
 		UploadURLCacheTTL:       5 * time.Minute,
 		MaxPacketBufferSize:     100,
 		PacketBufferTimeout:     30 * time.Second,
