@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -24,13 +25,15 @@ type uploadCacheKey struct {
 }
 
 type cachedUploadURL struct {
-	url       string
-	createdAt time.Time
+	url        string
+	createdAt  time.Time
+	generation uint64
 }
 
 var (
-	uploadCacheMu sync.Mutex
-	uploadCache   = map[uploadCacheKey]cachedUploadURL{}
+	uploadCacheMu    sync.Mutex
+	uploadCache      = map[uploadCacheKey]cachedUploadURL{}
+	uploadGeneration uint64
 )
 
 func UploadAndSendChunk(ctx context.Context, client *http.Client, accessToken string, chatPeerID int, to Target, sessionID string, sequence int, data []byte) error {
@@ -124,29 +127,29 @@ func sendAsTextMessage(ctx context.Context, client *http.Client, accessToken str
 func sendAsDocument(ctx context.Context, client *http.Client, accessToken string, chatPeerID int, to Target, sessionID string, sequence int, data []byte) error {
 	const maxUploadRetries = 3
 	var lastErr error
+	var lastGeneration uint64
 
 	for attempt := 0; attempt < maxUploadRetries; attempt++ {
 		if attempt > 0 {
-			invalidateUploadURL(accessToken, chatPeerID)
+			invalidateUploadURL(accessToken, chatPeerID, lastGeneration)
 			log.Printf("[%s] Retrying document upload seq=%d (attempt %d/%d)", sessionID, sequence, attempt+1, maxUploadRetries)
 		}
 
-		uploadURL, err := getUploadURL(ctx, client, accessToken, chatPeerID, sessionID)
+		uploadURL, gen, err := getUploadURL(ctx, client, accessToken, chatPeerID, sessionID)
 		if err != nil {
 			lastErr = err
 			continue
 		}
+		lastGeneration = gen
 
 		uploadResult, err := uploadDocument(ctx, client, uploadURL, data)
 		if err != nil {
-			invalidateUploadURL(accessToken, chatPeerID)
 			lastErr = err
 			continue
 		}
 
 		fileValue := stringFromAny(uploadResult["file"])
 		if fileValue == "" {
-			invalidateUploadURL(accessToken, chatPeerID)
 			lastErr = fmt.Errorf("[%s] VK upload response did not contain file field", sessionID)
 			continue
 		}
@@ -177,14 +180,14 @@ func sendAsDocument(ctx context.Context, client *http.Client, accessToken string
 	return lastErr
 }
 
-func getUploadURL(ctx context.Context, client *http.Client, accessToken string, chatPeerID int, sessionID string) (string, error) {
+func getUploadURL(ctx context.Context, client *http.Client, accessToken string, chatPeerID int, sessionID string) (string, uint64, error) {
 	key := uploadCacheKey{token: accessToken, peerID: chatPeerID}
 	now := time.Now()
 
 	uploadCacheMu.Lock()
 	if cached, ok := uploadCache[key]; ok && now.Sub(cached.createdAt) < Engine().UploadURLCacheTTL {
 		uploadCacheMu.Unlock()
-		return cached.url, nil
+		return cached.url, cached.generation, nil
 	}
 	uploadCacheMu.Unlock()
 
@@ -192,27 +195,31 @@ func getUploadURL(ctx context.Context, client *http.Client, accessToken string, 
 		"peer_id": {strconv.Itoa(chatPeerID)},
 	}, accessToken)
 	if err != nil {
-		return "", fmt.Errorf("[%s] docs.getMessagesUploadServer failed: %w", sessionID, err)
+		return "", 0, fmt.Errorf("[%s] docs.getMessagesUploadServer failed: %w", sessionID, err)
 	}
 	response, ok := resp["response"].(map[string]any)
 	if !ok {
-		return "", fmt.Errorf("[%s] docs.getMessagesUploadServer missing response object", sessionID)
+		return "", 0, fmt.Errorf("[%s] docs.getMessagesUploadServer missing response object", sessionID)
 	}
 	uploadURL := stringFromAny(response["upload_url"])
 	if uploadURL == "" {
-		return "", fmt.Errorf("[%s] docs.getMessagesUploadServer missing upload_url", sessionID)
+		return "", 0, fmt.Errorf("[%s] docs.getMessagesUploadServer missing upload_url", sessionID)
 	}
 
+	gen := atomic.AddUint64(&uploadGeneration, 1)
 	uploadCacheMu.Lock()
-	uploadCache[key] = cachedUploadURL{url: uploadURL, createdAt: now}
+	uploadCache[key] = cachedUploadURL{url: uploadURL, createdAt: now, generation: gen}
 	uploadCacheMu.Unlock()
-	return uploadURL, nil
+	return uploadURL, gen, nil
 }
 
-func invalidateUploadURL(accessToken string, chatPeerID int) {
+func invalidateUploadURL(accessToken string, chatPeerID int, generation uint64) {
 	uploadCacheMu.Lock()
 	defer uploadCacheMu.Unlock()
-	delete(uploadCache, uploadCacheKey{token: accessToken, peerID: chatPeerID})
+	key := uploadCacheKey{token: accessToken, peerID: chatPeerID}
+	if cached, ok := uploadCache[key]; ok && cached.generation == generation {
+		delete(uploadCache, key)
+	}
 }
 
 func uploadDocument(ctx context.Context, client *http.Client, uploadURL string, data []byte) (map[string]any, error) {
