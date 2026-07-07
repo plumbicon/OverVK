@@ -38,7 +38,7 @@ func DefaultEngineConfig() EngineConfig {
 		ChunkTimeout:            20 * time.Millisecond,
 		SenderWorkers:           16,
 		VKMessageMaxLength:    4096,
-		TextMessageThreshold:  8 * 1024,
+		TextMessageThreshold:  7 * 1024,
 		UploadURLCacheTTL:       5 * time.Minute,
 		MaxPacketBufferSize:     100,
 		PacketBufferTimeout:     30 * time.Second,

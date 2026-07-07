@@ -36,17 +36,25 @@ var (
 	uploadGeneration uint64
 )
 
-const headerOverhead = 80 // To + Type + SessionID + MessageID + Part + separator
+// To: server\n + Type: data\n + SessionID: <UUID-36>\n + MessageID: <7digits>\n + Part: XXX/XXX\n + \n\n
+const headerOverhead = 110
+
+func base64Len(n int) int {
+	return (n + 2) / 3 * 4
+}
 
 func maxTextPayload(engine EngineConfig) int {
-	maxChars := engine.VKMessageMaxLength
+	limit := engine.VKMessageMaxLength
 	if CipherEnabled() {
-		// outer base64(encrypt(...)) ≤ maxChars
-		maxCipher := maxChars * 3 / 4
-		maxChars = maxCipher - 28 // 12 nonce + 16 GCM tag
+		// base64(nonce + encrypt(plaintext) + tag) ≤ limit
+		// → nonce + plaintext + tag ≤ floor(limit / 4) * 3
+		maxCipher := (limit / 4) * 3
+		limit = maxCipher - 28 // 12 nonce + 16 GCM tag
 	}
-	maxBase64Payload := maxChars - headerOverhead
-	return maxBase64Payload * 3 / 4
+	// headers + "\n\n" + base64(payload) ≤ limit
+	maxBase64 := limit - headerOverhead
+	// base64Len(n) = ceil(n/3)*4, so n ≤ floor(maxBase64/4)*3
+	return (maxBase64 / 4) * 3
 }
 
 func UploadAndSendChunk(ctx context.Context, client *http.Client, accessToken string, chatPeerID int, to Target, sessionID string, sequence int, data []byte) error {

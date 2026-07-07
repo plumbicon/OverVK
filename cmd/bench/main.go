@@ -50,8 +50,8 @@ func main() {
 	binaryPath := flag.String("bin", "", "path to overvk binary (default: auto-build)")
 	serverCfg := flag.String("server-config", "config/server.yaml", "base server config")
 	clientCfg := flag.String("client-config", "config/client.yaml", "base client config")
-	requestTimeout := flag.Duration("timeout", 120*time.Second, "per-request timeout")
-	bootstrapWait := flag.Duration("bootstrap", 15*time.Second, "time to wait for bootstrap")
+	requestTimeout := flag.Duration("timeout", 300*time.Second, "per-request timeout")
+	bootstrapWait := flag.Duration("bootstrap", 45*time.Second, "time to wait for bootstrap")
 	flag.Parse()
 
 	urls := defaultURLs()
@@ -87,7 +87,7 @@ func main() {
 	}
 
 	var combos []params
-	for threshold := 8 * 1024; threshold <= 10*1024; threshold += 1024 {
+	for threshold := 5 * 1024; threshold <= 8*1024; threshold += 1024 {
 		for chunkMs := 10; chunkMs <= 40; chunkMs += 10 {
 			combos = append(combos, params{
 				ChunkTimeout:         time.Duration(chunkMs) * time.Millisecond,
@@ -98,7 +98,7 @@ func main() {
 
 	fmt.Printf("OverVK Parameter Sweep\n")
 	fmt.Printf("Combos: %d | URLs: %d | Iterations: %d\n", len(combos), len(urls), *iterations)
-	fmt.Printf("Threshold: 8KB-10KB (step 1KB) | ChunkTimeout: 10ms-40ms (step 10ms)\n")
+	fmt.Printf("Threshold: 5KB-8KB (step 1KB) | ChunkTimeout: 10ms-40ms (step 10ms)\n")
 	fmt.Println(strings.Repeat("═", 110))
 
 	var allCombos []comboResult
@@ -121,6 +121,13 @@ func main() {
 			cr.AvgThroughput,
 			float64(cr.TotalBytes)/1024,
 			cr.SuccessRate*100)
+		if cr.SuccessRate < 1.0 {
+			for _, r := range cr.Results {
+				if r.Err != nil {
+					fmt.Printf("    FAIL %s: %v\n", r.URL, r.Err)
+				}
+			}
+		}
 	}
 
 	fmt.Println()
@@ -138,11 +145,8 @@ func runCombo(bin, serverBase, clientBase string, p params, urls []string,
 	}
 	defer os.RemoveAll(tmpDir)
 
-	engineOverride := fmt.Sprintf("\n  chunk_timeout: %s\n  text_message_threshold: %d\n",
-		p.ChunkTimeout.String(), p.TextMessageThreshold)
-
-	serverYAML := injectEngineParams(serverBase, engineOverride)
-	clientYAML := injectEngineParams(clientBase, engineOverride)
+	serverYAML := injectEngineParams(serverBase, p)
+	clientYAML := injectEngineParams(clientBase, p)
 
 	serverFile := filepath.Join(tmpDir, "server.yaml")
 	clientFile := filepath.Join(tmpDir, "client.yaml")
@@ -152,9 +156,14 @@ func runCombo(bin, serverBase, clientBase string, p params, urls []string,
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	serverLog, _ := os.Create(filepath.Join(tmpDir, "server.log"))
+	clientLog, _ := os.Create(filepath.Join(tmpDir, "client.log"))
+	defer serverLog.Close()
+	defer clientLog.Close()
+
 	serverCmd := exec.CommandContext(ctx, bin, serverFile)
-	serverCmd.Stdout = io.Discard
-	serverCmd.Stderr = io.Discard
+	serverCmd.Stdout = serverLog
+	serverCmd.Stderr = serverLog
 	if err := serverCmd.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "  server start error: %v\n", err)
 		return comboResult{Params: p}
@@ -167,8 +176,8 @@ func runCombo(bin, serverBase, clientBase string, p params, urls []string,
 	time.Sleep(1 * time.Second)
 
 	clientCmd := exec.CommandContext(ctx, bin, clientFile)
-	clientCmd.Stdout = io.Discard
-	clientCmd.Stderr = io.Discard
+	clientCmd.Stdout = clientLog
+	clientCmd.Stderr = clientLog
 	if err := clientCmd.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "  client start error: %v\n", err)
 		return comboResult{Params: p}
@@ -201,9 +210,18 @@ func runCombo(bin, serverBase, clientBase string, p params, urls []string,
 	client := &http.Client{Transport: transport, Timeout: requestTimeout}
 
 	var results []result
+	total := len(urls) * iterations
+	idx := 0
 	for _, u := range urls {
 		for i := 0; i < iterations; i++ {
+			idx++
+			fmt.Printf("  [%d/%d] %s ...", idx, total, u)
 			r := fetch(client, u)
+			if r.Err != nil {
+				fmt.Printf(" ERR %v\n", r.Err)
+			} else {
+				fmt.Printf(" %d %s %.1fKB\n", r.Status, r.Total.Round(time.Millisecond), float64(r.Bytes)/1024)
+			}
 			results = append(results, r)
 		}
 	}
@@ -214,10 +232,10 @@ func runCombo(bin, serverBase, clientBase string, p params, urls []string,
 	return summarizeCombo(p, results)
 }
 
-func injectEngineParams(base, override string) string {
+func injectEngineParams(base string, p params) string {
 	lines := strings.Split(base, "\n")
 	var out []string
-	skipIndented := false
+	inEngine := false
 	engineFound := false
 
 	for _, line := range lines {
@@ -225,23 +243,31 @@ func injectEngineParams(base, override string) string {
 
 		if trimmed == "engine:" {
 			engineFound = true
-			skipIndented = true
-			out = append(out, "engine:"+override)
+			inEngine = true
+			out = append(out, line)
 			continue
 		}
 
-		if skipIndented {
-			if strings.HasPrefix(line, "  ") && !strings.HasPrefix(trimmed, "#") && trimmed != "" {
+		if inEngine {
+			if strings.HasPrefix(line, "  ") && trimmed != "" && !strings.HasPrefix(trimmed, "#") {
+				if strings.HasPrefix(trimmed, "chunk_timeout:") {
+					out = append(out, fmt.Sprintf("  chunk_timeout: %s", p.ChunkTimeout.String()))
+				} else if strings.HasPrefix(trimmed, "text_message_threshold:") {
+					out = append(out, fmt.Sprintf("  text_message_threshold: %d", p.TextMessageThreshold))
+				} else {
+					out = append(out, line)
+				}
 				continue
 			}
-			skipIndented = false
+			inEngine = false
 		}
 
 		out = append(out, line)
 	}
 
 	if !engineFound {
-		out = append(out, "engine:"+override)
+		out = append(out, fmt.Sprintf("engine:\n  chunk_timeout: %s\n  text_message_threshold: %d",
+			p.ChunkTimeout.String(), p.TextMessageThreshold))
 	}
 
 	return strings.Join(out, "\n")
