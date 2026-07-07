@@ -59,7 +59,7 @@ type serverApp struct {
 }
 
 func main() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
 
 	if len(os.Args) != 2 {
 		fmt.Fprintf(os.Stderr, "usage: %s path/to/config.yaml\n", os.Args[0])

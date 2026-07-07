@@ -10,3 +10,6 @@ __pycache__/
 # Go
 bin/
 /overvk
+
+# Test logs
+test-logs/
