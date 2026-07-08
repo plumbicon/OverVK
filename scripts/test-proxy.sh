@@ -7,12 +7,21 @@ BIN="$LOGDIR/overvk"
 SERVER_LOG="$LOGDIR/server.log"
 CLIENT_LOG="$LOGDIR/client.log"
 RESULTS="$LOGDIR/results.log"
-SOCKS_PORT=8888
+PROXY_PORT=8888
 BOOTSTRAP_WAIT=60
 REQUEST_TIMEOUT=120
 
+# Detect proxy type from client config
+PROXY_TYPE=$(awk '/^proxy_type:/{gsub(/[" ]/, "", $2); print $2}' "$PROJECT/config/client.yaml" 2>/dev/null)
+[ -z "$PROXY_TYPE" ] && PROXY_TYPE="socks"
+
 mkdir -p "$LOGDIR"
 cd "$PROJECT"
+
+# Kill any leftover overvk processes and processes on the proxy port
+pkill -f "$BIN" 2>/dev/null || true
+lsof -ti :"$PROXY_PORT" 2>/dev/null | xargs kill 2>/dev/null || true
+sleep 1
 
 echo "=== Building overvk ===" | tee "$RESULTS"
 go build -o "$BIN" ./cmd/overvk
@@ -35,22 +44,31 @@ echo "=== Starting client ===" | tee -a "$RESULTS"
 "$BIN" config/client.yaml >"$CLIENT_LOG" 2>&1 &
 CLIENT_PID=$!
 
-echo "=== Waiting for SOCKS5 on port $SOCKS_PORT ===" | tee -a "$RESULTS"
+echo "=== Waiting for proxy on port $PROXY_PORT (type=$PROXY_TYPE) ===" | tee -a "$RESULTS"
 DEADLINE=$((SECONDS + BOOTSTRAP_WAIT))
 while [ $SECONDS -lt $DEADLINE ]; do
-    if nc -z 127.0.0.1 $SOCKS_PORT 2>/dev/null; then
-        echo "SOCKS5 ready after ${SECONDS}s" | tee -a "$RESULTS"
+    if nc -z 127.0.0.1 $PROXY_PORT 2>/dev/null; then
+        echo "Proxy ready after ${SECONDS}s" | tee -a "$RESULTS"
         break
     fi
     sleep 1
 done
 
-if ! nc -z 127.0.0.1 $SOCKS_PORT 2>/dev/null; then
-    echo "SOCKS5 not ready after ${BOOTSTRAP_WAIT}s — aborting" | tee -a "$RESULTS"
+if ! nc -z 127.0.0.1 $PROXY_PORT 2>/dev/null; then
+    echo "Proxy not ready after ${BOOTSTRAP_WAIT}s — aborting" | tee -a "$RESULTS"
     exit 1
 fi
 
 sleep 3
+
+# Set curl proxy flags based on proxy type
+if [ "$PROXY_TYPE" = "http" ]; then
+    CURL_PROXY_FLAGS="--proxy http://127.0.0.1:$PROXY_PORT --cacert $PROJECT/config/ca.crt"
+    echo "Using HTTP proxy with MITM CA" | tee -a "$RESULTS"
+else
+    CURL_PROXY_FLAGS="--socks5-hostname 127.0.0.1:$PROXY_PORT"
+    echo "Using SOCKS5 proxy" | tee -a "$RESULTS"
+fi
 
 # URLs from smallest to largest
 URLS=(
@@ -66,8 +84,8 @@ echo "=== Running fetch tests ===" | tee -a "$RESULTS"
 
 for url in "${URLS[@]}"; do
     echo -n "Fetching: $url ... " | tee -a "$RESULTS"
-    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}|%{size_download}|%{time_total}|%{time_starttransfer}" \
-        --socks5-hostname "127.0.0.1:$SOCKS_PORT" \
+    HTTP_CODE=$(curl -s -L -o /dev/null -w "%{http_code}|%{size_download}|%{time_total}|%{time_starttransfer}" \
+        $CURL_PROXY_FLAGS \
         --max-time "$REQUEST_TIMEOUT" \
         "$url" 2>&1) || true
 

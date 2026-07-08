@@ -49,7 +49,7 @@ func StartSenderWorkers(ctx context.Context, queue *SenderQueue, client *http.Cl
 						defer queue.wg.Done()
 						peerID := rotator.Next()
 						log.Printf("[Worker-%d][%s] Sending %d bytes for seq %d to peer %d", workerID, item.SessionID, len(item.Data), item.Sequence, peerID)
-						if err := UploadAndSendChunk(ctx, client, accessToken, peerID, item.Target, item.SessionID, item.Sequence, item.Data); err != nil {
+						if err := UploadAndSendChunk(ctx, client, accessToken, peerID, rotator, item.Target, item.SessionID, item.Sequence, item.Data); err != nil {
 							log.Printf("[Worker-%d][%s] Sender failed for seq %d: %v", workerID, item.SessionID, item.Sequence, err)
 						}
 					}()

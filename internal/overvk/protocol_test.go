@@ -25,7 +25,7 @@ func TestUploadDocumentPreservesPostAcrossRedirect(t *testing.T) {
 	defer target.Close()
 
 	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, target.URL, http.StatusFound)
+		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
 	}))
 	defer redirect.Close()
 

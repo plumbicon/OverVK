@@ -26,6 +26,10 @@ type RuntimeConfig struct {
 	PeerIDs         []int
 	HandshakePhrase string
 	Verbose         bool
+	TLSMITM         bool
+	MITMCACert      string
+	MITMCAKey       string
+	ProxyType       ProxyType
 	Engine          EngineConfig
 }
 
@@ -37,6 +41,10 @@ type rawConfig struct {
 	HandshakePhrase string          `yaml:"handshake_phrase"`
 	DiscoveryPhrase string          `yaml:"discovery_phrase"`
 	Verbose         bool            `yaml:"verbose"`
+	TLSMITM         bool            `yaml:"tls_mitm"`
+	MITMCACert      string          `yaml:"mitm_ca_cert"`
+	MITMCAKey       string          `yaml:"mitm_ca_key"`
+	ProxyType       string          `yaml:"proxy_type"`
 	Engine          rawEngineConfig `yaml:"engine"`
 }
 
@@ -86,6 +94,15 @@ func LoadRuntimeConfig(path string) (RuntimeConfig, error) {
 		handshakePhrase = DefaultHandshakePhrase
 	}
 
+	proxyType := ProxyType(strings.TrimSpace(raw.ProxyType))
+	if proxyType == "" {
+		proxyType = ProxySOCKS5
+	}
+	tlsMITM := raw.TLSMITM
+	if proxyType == ProxyHTTP {
+		tlsMITM = true
+	}
+
 	config := RuntimeConfig{
 		Mode:            raw.Mode,
 		Token:           strings.TrimSpace(raw.Token),
@@ -93,6 +110,10 @@ func LoadRuntimeConfig(path string) (RuntimeConfig, error) {
 		GroupID:         raw.GroupID,
 		HandshakePhrase: handshakePhrase,
 		Verbose:         raw.Verbose,
+		TLSMITM:         tlsMITM,
+		MITMCACert:      strings.TrimSpace(raw.MITMCACert),
+		MITMCAKey:       strings.TrimSpace(raw.MITMCAKey),
+		ProxyType:       proxyType,
 		Engine:          engine,
 	}
 	if err := config.Validate(); err != nil {

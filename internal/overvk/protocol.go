@@ -57,7 +57,7 @@ func maxTextPayload(engine EngineConfig) int {
 	return (maxBase64 / 4) * 3
 }
 
-func UploadAndSendChunk(ctx context.Context, client *http.Client, accessToken string, chatPeerID int, to Target, sessionID string, sequence int, data []byte) error {
+func UploadAndSendChunk(ctx context.Context, client *http.Client, accessToken string, chatPeerID int, rotator *ChatRotator, to Target, sessionID string, sequence int, data []byte) error {
 	metric := GetSessionMetrics(sessionID)
 	started := time.Now()
 	engine := Engine()
@@ -88,20 +88,23 @@ func UploadAndSendChunk(ctx context.Context, client *http.Client, accessToken st
 	}
 
 	log.Printf("[%s] Sending %d bytes as DOCUMENT (seq %d)", sessionID, len(data), sequence)
-	if err := sendAsDocument(ctx, client, accessToken, chatPeerID, to, sessionID, sequence, data); err != nil {
-		log.Printf("[%s] Document upload failed for seq %d, falling back to TEXT: %v", sessionID, sequence, err)
+	if err := sendAsDocument(ctx, client, accessToken, chatPeerID, rotator, to, sessionID, sequence, data); err != nil {
+		const maxTextFallbackParts = 16
 		numParts := (len(data) + maxPayload - 1) / maxPayload
-		if numParts == 0 {
-			numParts = 1
+		if numParts > maxTextFallbackParts {
+			log.Printf("[%s] Document upload failed for seq %d and TEXT fallback too large (%d parts): %v", sessionID, sequence, numParts, err)
+			metric.RecordSend(len(data), false, 1, false)
+			return err
 		}
-		log.Printf("[%s] Fallback: sending %d bytes as %d TEXT message(s) (seq %d)", sessionID, len(data), numParts, sequence)
+		fallbackPeerID := rotator.Next()
+		log.Printf("[%s] Document upload failed for seq %d, falling back to %d TEXT messages via peer %d: %v", sessionID, sequence, numParts, fallbackPeerID, err)
 		for partIndex := 0; partIndex < numParts; partIndex++ {
 			start := partIndex * maxPayload
 			end := start + maxPayload
 			if end > len(data) {
 				end = len(data)
 			}
-			if err := sendAsTextMessage(ctx, client, accessToken, chatPeerID, to, sessionID, sequence, data[start:end], partIndex, numParts); err != nil {
+			if err := sendAsTextMessage(ctx, client, accessToken, fallbackPeerID, to, sessionID, sequence, data[start:end], partIndex, numParts); err != nil {
 				metric.RecordSend(len(data), true, numParts, false)
 				return err
 			}
@@ -153,38 +156,38 @@ func sendAsTextMessage(ctx context.Context, client *http.Client, accessToken str
 	return nil
 }
 
-func sendAsDocument(ctx context.Context, client *http.Client, accessToken string, chatPeerID int, to Target, sessionID string, sequence int, data []byte) error {
-	const maxUploadRetries = 3
+func sendAsDocument(ctx context.Context, client *http.Client, accessToken string, chatPeerID int, rotator *ChatRotator, to Target, sessionID string, sequence int, data []byte) error {
+	const maxUploadRetries = 5
 	var lastErr error
-	var lastGeneration uint64
+	peerID := chatPeerID
+
+	encData, err := Encrypt(data)
+	if err != nil {
+		return fmt.Errorf("[%s] encrypt document data: %w", sessionID, err)
+	}
 
 	for attempt := 0; attempt < maxUploadRetries; attempt++ {
 		if attempt > 0 {
-			invalidateUploadURL(accessToken, chatPeerID, lastGeneration)
-			log.Printf("[%s] Retrying document upload seq=%d (attempt %d/%d)", sessionID, sequence, attempt+1, maxUploadRetries)
+			peerID = rotator.Next()
+			log.Printf("[%s] Retrying document upload seq=%d via peer %d (attempt %d/%d)", sessionID, sequence, peerID, attempt+1, maxUploadRetries)
 		}
 
-		uploadURL, gen, err := getUploadURL(ctx, client, accessToken, chatPeerID, sessionID)
+		uploadURL, _, err := getUploadURL(ctx, client, accessToken, peerID, sessionID)
 		if err != nil {
 			lastErr = err
-			continue
-		}
-		lastGeneration = gen
-
-		encData, err := Encrypt(data)
-		if err != nil {
-			lastErr = fmt.Errorf("[%s] encrypt document data: %w", sessionID, err)
 			continue
 		}
 
 		uploadResult, err := uploadDocument(ctx, client, uploadURL, encData)
 		if err != nil {
+			invalidateUploadURL(accessToken, peerID, 0)
 			lastErr = err
 			continue
 		}
 
 		fileValue := stringFromAny(uploadResult["file"])
 		if fileValue == "" {
+			invalidateUploadURL(accessToken, peerID, 0)
 			lastErr = fmt.Errorf("[%s] VK upload response did not contain file field", sessionID)
 			continue
 		}
@@ -204,7 +207,7 @@ func sendAsDocument(ctx context.Context, client *http.Client, accessToken string
 			return fmt.Errorf("[%s] encrypt document header: %w", sessionID, err)
 		}
 		_, err = APICall(ctx, client, "messages.send", url.Values{
-			"peer_id":    {strconv.Itoa(chatPeerID)},
+			"peer_id":    {strconv.Itoa(peerID)},
 			"message":    {headerBlock},
 			"attachment": {attachment},
 			"random_id":  {randomID()},
@@ -255,6 +258,10 @@ func invalidateUploadURL(accessToken string, chatPeerID int, generation uint64) 
 	uploadCacheMu.Lock()
 	defer uploadCacheMu.Unlock()
 	key := uploadCacheKey{token: accessToken, peerID: chatPeerID}
+	if generation == 0 {
+		delete(uploadCache, key)
+		return
+	}
 	if cached, ok := uploadCache[key]; ok && cached.generation == generation {
 		delete(uploadCache, key)
 	}

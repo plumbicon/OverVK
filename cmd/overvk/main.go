@@ -24,6 +24,7 @@ type clientSession struct {
 	ack           chan struct{}
 	ackOnce       sync.Once
 	incoming      chan overvk.Packet
+	httpResp      chan []byte
 	writerStarted bool
 	mu            sync.Mutex
 }
@@ -76,6 +77,12 @@ func main() {
 	}
 	if config.Key != "" {
 		log.Println("Encryption enabled (AES-256-GCM)")
+	}
+	if config.TLSMITM {
+		if err := overvk.ConfigureMITM(true, config.MITMCACert, config.MITMCAKey); err != nil {
+			log.Fatalf("MITM setup failed: %v", err)
+		}
+		log.Println("TLS MITM proxy enabled")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -144,9 +151,13 @@ func runClient(rootCtx context.Context, config overvk.RuntimeConfig) {
 	address := net.JoinHostPort(engine.SOCKSHost, strconv.Itoa(engine.SOCKSPort))
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
-		log.Fatalf("failed to start SOCKS5 proxy on %s: %v", address, err)
+		log.Fatalf("failed to start proxy on %s: %v", address, err)
 	}
-	log.Printf("SOCKS5 local proxy started on %s", address)
+	if config.ProxyType == overvk.ProxyHTTP {
+		log.Printf("HTTP proxy started on %s (TLS MITM enabled)", address)
+	} else {
+		log.Printf("SOCKS5 local proxy started on %s", address)
+	}
 
 	go func() {
 		<-rootCtx.Done()
@@ -162,7 +173,11 @@ func runClient(rootCtx context.Context, config overvk.RuntimeConfig) {
 			log.Printf("accept error: %v", err)
 			continue
 		}
-		go app.handleBrowserConnection(rootCtx, conn)
+		if config.ProxyType == overvk.ProxyHTTP {
+			go app.handleHTTPProxyConnection(rootCtx, conn)
+		} else {
+			go app.handleBrowserConnection(rootCtx, conn)
+		}
 	}
 
 	log.Print("Shutting down client: waiting for sender queue")
@@ -199,6 +214,20 @@ func (a *clientApp) handleServerMessage(ctx context.Context, message overvk.Pars
 			go overvk.WriteOrderedPackets(ctx, sessionID, session.conn, session.incoming, a.config.Verbose)
 		}
 		session.mu.Unlock()
+	case overvk.MessageHTTPResp:
+		session := a.getSession(sessionID)
+		if session == nil {
+			return
+		}
+		respData, err := overvk.ExtractHTTPResponsePayload(ctx, a.httpClient, message)
+		if err != nil {
+			log.Printf("[%s] failed to extract HTTP response: %v", sessionID, err)
+			return
+		}
+		select {
+		case session.httpResp <- respData:
+		default:
+		}
 	case overvk.MessageClose:
 		session := a.getSession(sessionID)
 		if session != nil {
@@ -260,10 +289,99 @@ func (a *clientApp) handleBrowserConnection(ctx context.Context, conn net.Conn) 
 	}
 	log.Printf("[%s] Tunnel established", sessionID)
 
+	if port == 443 && overvk.MITMEnabled() {
+		tlsConn, err := overvk.WrapClientConn(conn, host)
+		if err != nil {
+			log.Printf("[%s] TLS MITM failed for %s: %v", sessionID, host, err)
+			return
+		}
+		conn = tlsConn
+		session.mu.Lock()
+		session.conn = tlsConn
+		session.mu.Unlock()
+		log.Printf("[%s] TLS MITM active for %s", sessionID, host)
+	}
+
 	nextSequence := overvk.DataSenderHandler(ctx, "Uplink", sessionID, conn, overvk.TargetServer, a.sender)
 	closePeerID := a.rotator.Next()
 	if err := overvk.SendControlMessage(context.Background(), a.httpClient, a.config.Token, closePeerID, overvk.TargetServer, overvk.MessageClose, sessionID, nextSequence, ""); err != nil {
 		log.Printf("[%s] failed to send CLOSE: %v", sessionID, err)
+	}
+}
+
+func (a *clientApp) handleHTTPProxyConnection(ctx context.Context, conn net.Conn) {
+	sessionID := overvk.NewSessionID()
+	defer func() {
+		_ = conn.Close()
+		log.Printf("[%s] HTTP proxy connection closed", sessionID)
+	}()
+
+	method, host, port, req, err := overvk.ReadHTTPRequest(conn)
+	if err != nil {
+		log.Printf("[%s] failed to read HTTP request: %v", sessionID, err)
+		return
+	}
+
+	if method == "CONNECT" {
+		if err := overvk.HandleHTTPConnect(conn, host, port); err != nil {
+			log.Printf("[%s] CONNECT failed: %v", sessionID, err)
+			return
+		}
+		log.Printf("[%s] HTTP CONNECT for %s:%d", sessionID, host, port)
+
+		tlsConn, err := overvk.WrapClientConn(conn, host)
+		if err != nil {
+			log.Printf("[%s] TLS MITM failed for %s: %v", sessionID, host, err)
+			return
+		}
+		conn = tlsConn
+
+		req, err = overvk.ReadHTTPRequestFromTLS(conn, host, true)
+		if err != nil {
+			log.Printf("[%s] failed to read HTTPS request from MITM: %v", sessionID, err)
+			return
+		}
+		log.Printf("[%s] HTTPS %s %s", sessionID, req.Method, req.URL)
+	} else {
+		log.Printf("[%s] HTTP %s %s", sessionID, req.Method, req.URL)
+	}
+
+	session := &clientSession{
+		conn:     conn,
+		ack:      make(chan struct{}),
+		httpResp: make(chan []byte, 1),
+		incoming: make(chan overvk.Packet, 1),
+	}
+	a.setSession(sessionID, session)
+	defer a.deleteSession(sessionID)
+
+	reqData, err := overvk.SerializeHTTPRequest(req)
+	if err != nil {
+		log.Printf("[%s] failed to serialize request: %v", sessionID, err)
+		return
+	}
+
+	peerID := a.rotator.Next()
+	if err := overvk.SendHTTPRequestMessage(ctx, a.httpClient, a.config.Token, peerID, a.rotator, sessionID, reqData); err != nil {
+		log.Printf("[%s] failed to send HTTP request via VK: %v", sessionID, err)
+		return
+	}
+
+	select {
+	case respData := <-session.httpResp:
+		status, headers, body, err := overvk.DeserializeHTTPResponse(respData)
+		if err != nil {
+			log.Printf("[%s] failed to deserialize response: %v", sessionID, err)
+			return
+		}
+		if err := overvk.WriteHTTPResponse(conn, status, headers, body); err != nil {
+			log.Printf("[%s] failed to write response to browser: %v", sessionID, err)
+		}
+		log.Printf("[%s] HTTP %d, %d bytes", sessionID, status, len(body))
+	case <-ctx.Done():
+	case <-timeAfter(a.config.Engine.HTTPTimeout):
+		log.Printf("[%s] HTTP response timeout", sessionID)
+		overvk.WriteHTTPResponse(conn, 504, map[string]string{}, []byte("Gateway Timeout"))
 	}
 }
 
@@ -341,6 +459,9 @@ func (a *serverApp) handleClientMessage(ctx context.Context, message overvk.Pars
 		}
 		session.mu.Unlock()
 
+	case overvk.MessageHTTPReq:
+		go a.handleHTTPRequest(ctx, sessionID, message)
+
 	case overvk.MessageClose:
 		session := a.popSession(sessionID)
 		if session != nil {
@@ -359,8 +480,14 @@ func (a *serverApp) serverWriterTask(ctx context.Context, sessionID string, sess
 	address := net.JoinHostPort(session.host, strconv.Itoa(session.port))
 	log.Printf("[%s] Writer task started, connecting to %s", sessionID, address)
 
-	var dialer net.Dialer
-	conn, err := dialer.DialContext(ctx, "tcp", address)
+	var conn net.Conn
+	var err error
+	if session.port == 443 && overvk.MITMEnabled() {
+		conn, err = overvk.DialTLS(ctx, session.host, session.port)
+	} else {
+		var dialer net.Dialer
+		conn, err = dialer.DialContext(ctx, "tcp", address)
+	}
 	if err != nil {
 		log.Printf("[%s] connection failed in server writer task: %v", sessionID, err)
 		a.deleteSession(sessionID)
@@ -378,6 +505,37 @@ func (a *serverApp) downlinkHandler(ctx context.Context, sessionID string, conn 
 	peerID := a.rotator.Next()
 	if err := overvk.SendControlMessage(context.Background(), a.httpClient, a.config.Token, peerID, overvk.TargetClient, overvk.MessageClose, sessionID, nextSequence+1, ""); err != nil {
 		log.Printf("[%s] failed to send downlink CLOSE: %v", sessionID, err)
+	}
+}
+
+func (a *serverApp) handleHTTPRequest(ctx context.Context, sessionID string, message overvk.ParsedMessage) {
+	reqData, err := overvk.ExtractHTTPResponsePayload(ctx, a.httpClient, message)
+	if err != nil {
+		log.Printf("[%s] failed to extract HTTP request payload: %v", sessionID, err)
+		return
+	}
+
+	log.Printf("[%s] Executing HTTP request (%d bytes)", sessionID, len(reqData))
+	started := time.Now()
+
+	status, headers, body, err := overvk.ExecuteHTTPRequest(ctx, reqData)
+	if err != nil {
+		log.Printf("[%s] HTTP request failed: %v", sessionID, err)
+		status = 502
+		headers = map[string]string{"Content-Type": "text/plain"}
+		body = []byte(fmt.Sprintf("Bad Gateway: %v", err))
+	}
+	log.Printf("[%s] HTTP %d, %d bytes in %v", sessionID, status, len(body), time.Since(started).Round(time.Millisecond))
+
+	respData, err := overvk.SerializeHTTPResponse(status, headers, body)
+	if err != nil {
+		log.Printf("[%s] failed to serialize response: %v", sessionID, err)
+		return
+	}
+
+	peerID := a.rotator.Next()
+	if err := overvk.SendHTTPResponseMessage(ctx, a.httpClient, a.config.Token, peerID, a.rotator, sessionID, respData); err != nil {
+		log.Printf("[%s] failed to send HTTP response via VK: %v", sessionID, err)
 	}
 }
 

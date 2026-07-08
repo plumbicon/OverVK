@@ -132,6 +132,13 @@ func StartLongPollListener(ctx context.Context, client *http.Client, accessToken
 		peerSet[peerID] = struct{}{}
 	}
 
+	const deduplicationCapacity = 2048
+	type deduplicationKey struct {
+		peerID    int
+		messageID int
+	}
+	seenMessages := make(map[deduplicationKey]struct{}, deduplicationCapacity)
+
 	log.Printf("starting VK Group Long Poll listener for group_id=%d", groupID)
 	if len(peerIDs) > 0 {
 		log.Printf("listening to peer IDs: %v", peerIDs)
@@ -204,7 +211,6 @@ func StartLongPollListener(ctx context.Context, client *http.Client, accessToken
 
 		for _, update := range lp.Updates {
 			if update.Type != "message_new" {
-				log.Printf("bootstrap saw VK update type=%q", update.Type)
 				continue
 			}
 			message := update.Object.VKMessage()
@@ -212,6 +218,19 @@ func StartLongPollListener(ctx context.Context, client *http.Client, accessToken
 				if _, ok := peerSet[message.PeerID]; !ok {
 					continue
 				}
+			}
+			if message.ConversationMessageID > 0 {
+				dk := deduplicationKey{peerID: message.PeerID, messageID: message.ConversationMessageID}
+				if _, dup := seenMessages[dk]; dup {
+					continue
+				}
+				if len(seenMessages) >= deduplicationCapacity {
+					for k := range seenMessages {
+						delete(seenMessages, k)
+						break
+					}
+				}
+				seenMessages[dk] = struct{}{}
 			}
 			parsed := ParseMessage(message)
 			go handler(ctx, parsed)
@@ -652,9 +671,10 @@ func (o lpObject) VKMessage() vkMessage {
 }
 
 type vkMessage struct {
-	PeerID      int            `json:"peer_id"`
-	Text        string         `json:"text"`
-	Attachments []vkAttachment `json:"attachments"`
+	PeerID                int            `json:"peer_id"`
+	ConversationMessageID int            `json:"conversation_message_id"`
+	Text                  string         `json:"text"`
+	Attachments           []vkAttachment `json:"attachments"`
 }
 
 type vkAttachment struct {

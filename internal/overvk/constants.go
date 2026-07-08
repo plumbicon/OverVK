@@ -34,14 +34,14 @@ type EngineConfig struct {
 func DefaultEngineConfig() EngineConfig {
 	return EngineConfig{
 		APIVersion:              "5.131",
-		MaxChunkSize:            1024 * 1024,
-		ChunkTimeout:            20 * time.Millisecond,
+		MaxChunkSize:            128 * 1024,
+		ChunkTimeout:            50 * time.Millisecond,
 		SenderWorkers:           16,
 		VKMessageMaxLength:    4096,
-		TextMessageThreshold:  7 * 1024,
+		TextMessageThreshold:  8 * 1024,
 		UploadURLCacheTTL:       5 * time.Minute,
-		MaxPacketBufferSize:     100,
-		PacketBufferTimeout:     30 * time.Second,
+		MaxPacketBufferSize:     500,
+		PacketBufferTimeout:     120 * time.Second,
 		SenderQueueSize:         1000,
 		SOCKSHost:               "127.0.0.1",
 		SOCKSPort:               8888,
@@ -81,6 +81,15 @@ const (
 	MessageClose    MessageType = "close"
 	MessageReady    MessageType = "ready"
 	MessageReadyACK MessageType = "ready_ack"
+	MessageHTTPReq  MessageType = "http_req"
+	MessageHTTPResp MessageType = "http_resp"
+)
+
+type ProxyType string
+
+const (
+	ProxySOCKS5 ProxyType = "socks"
+	ProxyHTTP   ProxyType = "http"
 )
 
 type Target string
