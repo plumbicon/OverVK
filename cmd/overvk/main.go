@@ -619,18 +619,26 @@ func (a *serverApp) serverWriterTask(ctx context.Context, sessionID string, sess
 	address := net.JoinHostPort(session.host, strconv.Itoa(session.port))
 	log.Printf("[%s] Writer task started, connecting to %s", sessionID, address)
 
+	dialCtx, cancelDial := context.WithTimeout(ctx, 10*time.Second)
+	defer cancelDial()
+
+	dialStart := time.Now()
 	var conn net.Conn
 	var err error
 	if session.port == 443 && overvk.MITMEnabled() {
-		conn, err = overvk.DialTLS(ctx, session.host, session.port)
+		conn, err = overvk.DialTLS(dialCtx, session.host, session.port)
 	} else {
 		var dialer net.Dialer
-		conn, err = dialer.DialContext(ctx, "tcp", address)
+		conn, err = dialer.DialContext(dialCtx, "tcp", address)
 	}
+	dialElapsed := time.Since(dialStart)
 	if err != nil {
-		log.Printf("[%s] connection failed in server writer task: %v", sessionID, err)
+		log.Printf("[%s] connection to %s failed in %v: %v", sessionID, address, dialElapsed.Round(time.Millisecond), err)
 		a.deleteSession(sessionID)
 		return
+	}
+	if dialElapsed > time.Second {
+		log.Printf("[%s] slow dial to %s: %v", sessionID, address, dialElapsed.Round(time.Millisecond))
 	}
 
 	go a.downlinkHandler(ctx, sessionID, conn)
