@@ -99,7 +99,7 @@ func LoadRuntimeConfig(path string) (RuntimeConfig, error) {
 		proxyType = ProxySOCKS5
 	}
 	tlsMITM := raw.TLSMITM
-	if proxyType == ProxyHTTP {
+	if proxyType == ProxyHTTP || proxyType == ProxyHybrid {
 		tlsMITM = true
 	}
 

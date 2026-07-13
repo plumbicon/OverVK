@@ -153,9 +153,12 @@ func runClient(rootCtx context.Context, config overvk.RuntimeConfig) {
 	if err != nil {
 		log.Fatalf("failed to start proxy on %s: %v", address, err)
 	}
-	if config.ProxyType == overvk.ProxyHTTP {
+	switch config.ProxyType {
+	case overvk.ProxyHTTP:
 		log.Printf("HTTP proxy started on %s (TLS MITM enabled)", address)
-	} else {
+	case overvk.ProxyHybrid:
+		log.Printf("Hybrid proxy started on %s (HTTP+MITM+streaming)", address)
+	default:
 		log.Printf("SOCKS5 local proxy started on %s", address)
 	}
 
@@ -173,9 +176,12 @@ func runClient(rootCtx context.Context, config overvk.RuntimeConfig) {
 			log.Printf("accept error: %v", err)
 			continue
 		}
-		if config.ProxyType == overvk.ProxyHTTP {
+		switch config.ProxyType {
+		case overvk.ProxyHTTP:
 			go app.handleHTTPProxyConnection(rootCtx, conn)
-		} else {
+		case overvk.ProxyHybrid:
+			go app.handleHybridConnection(rootCtx, conn)
+		default:
 			go app.handleBrowserConnection(rootCtx, conn)
 		}
 	}
@@ -385,6 +391,116 @@ func (a *clientApp) handleHTTPProxyConnection(ctx context.Context, conn net.Conn
 	}
 }
 
+func (a *clientApp) handleHybridConnection(ctx context.Context, conn net.Conn) {
+	sessionID := overvk.NewSessionID()
+	defer func() {
+		_ = conn.Close()
+		log.Printf("[%s] Hybrid proxy connection closed", sessionID)
+	}()
+
+	method, host, port, req, err := overvk.ReadHTTPRequest(conn)
+	if err != nil {
+		log.Printf("[%s] failed to read HTTP request: %v", sessionID, err)
+		return
+	}
+
+	if method != "CONNECT" {
+		a.handleHybridPlainHTTP(ctx, conn, sessionID, req)
+		return
+	}
+
+	if err := overvk.HandleHTTPConnect(conn, host, port); err != nil {
+		log.Printf("[%s] CONNECT failed: %v", sessionID, err)
+		return
+	}
+	log.Printf("[%s] Hybrid CONNECT for %s:%d", sessionID, host, port)
+
+	tlsConn, err := overvk.WrapClientConn(conn, host)
+	if err != nil {
+		log.Printf("[%s] TLS MITM failed for %s: %v", sessionID, host, err)
+		return
+	}
+	log.Printf("[%s] TLS MITM active, switching to streaming", sessionID)
+
+	session := &clientSession{
+		conn:     tlsConn,
+		ack:      make(chan struct{}),
+		incoming: make(chan overvk.Packet, a.config.Engine.MaxPacketBufferSize*2),
+	}
+	a.setSession(sessionID, session)
+	defer func() {
+		a.deleteSession(sessionID)
+		a.multipart.Cleanup(sessionID)
+	}()
+
+	peerID := a.rotator.Next()
+	connectPayload := net.JoinHostPort(host, strconv.Itoa(port))
+	if err := overvk.SendControlMessage(ctx, a.httpClient, a.config.Token, peerID, overvk.TargetServer, overvk.MessageConnect, sessionID, 0, connectPayload); err != nil {
+		log.Printf("[%s] failed to send CONNECT: %v", sessionID, err)
+		return
+	}
+
+	log.Printf("[%s] Waiting for session acknowledgement", sessionID)
+	select {
+	case <-session.ack:
+	case <-ctx.Done():
+		return
+	case <-timeAfter(a.config.Engine.ACKWait):
+		log.Printf("[%s] Session acknowledgement timeout", sessionID)
+		return
+	}
+
+	log.Printf("[%s] Hybrid tunnel established for %s:%d", sessionID, host, port)
+
+	nextSequence := overvk.DataSenderHandler(ctx, "Uplink", sessionID, tlsConn, overvk.TargetServer, a.sender)
+	closePeerID := a.rotator.Next()
+	if err := overvk.SendControlMessage(context.Background(), a.httpClient, a.config.Token, closePeerID, overvk.TargetServer, overvk.MessageClose, sessionID, nextSequence, ""); err != nil {
+		log.Printf("[%s] failed to send CLOSE: %v", sessionID, err)
+	}
+}
+
+func (a *clientApp) handleHybridPlainHTTP(ctx context.Context, conn net.Conn, sessionID string, req *http.Request) {
+	log.Printf("[%s] HTTP %s %s", sessionID, req.Method, req.URL)
+
+	session := &clientSession{
+		conn:     conn,
+		ack:      make(chan struct{}),
+		httpResp: make(chan []byte, 1),
+		incoming: make(chan overvk.Packet, 1),
+	}
+	a.setSession(sessionID, session)
+	defer a.deleteSession(sessionID)
+
+	reqData, err := overvk.SerializeHTTPRequest(req)
+	if err != nil {
+		log.Printf("[%s] failed to serialize request: %v", sessionID, err)
+		return
+	}
+
+	peerID := a.rotator.Next()
+	if err := overvk.SendHTTPRequestMessage(ctx, a.httpClient, a.config.Token, peerID, a.rotator, sessionID, reqData); err != nil {
+		log.Printf("[%s] failed to send HTTP request via VK: %v", sessionID, err)
+		return
+	}
+
+	select {
+	case respData := <-session.httpResp:
+		status, headers, body, err := overvk.DeserializeHTTPResponse(respData)
+		if err != nil {
+			log.Printf("[%s] failed to deserialize response: %v", sessionID, err)
+			return
+		}
+		if err := overvk.WriteHTTPResponse(conn, status, headers, body); err != nil {
+			log.Printf("[%s] failed to write response to browser: %v", sessionID, err)
+		}
+		log.Printf("[%s] HTTP %d, %d bytes", sessionID, status, len(body))
+	case <-ctx.Done():
+	case <-timeAfter(a.config.Engine.HTTPTimeout):
+		log.Printf("[%s] HTTP response timeout", sessionID)
+		overvk.WriteHTTPResponse(conn, 504, map[string]string{}, []byte("Gateway Timeout"))
+	}
+}
+
 func runServer(rootCtx context.Context, config overvk.RuntimeConfig) {
 	engine := config.Engine
 	httpClient := overvk.NewHTTPClient()
@@ -459,6 +575,9 @@ func (a *serverApp) handleClientMessage(ctx context.Context, message overvk.Pars
 		}
 		session.mu.Unlock()
 
+	case overvk.MessageReady:
+		a.handleClientReady(ctx, message)
+
 	case overvk.MessageHTTPReq:
 		go a.handleHTTPRequest(ctx, sessionID, message)
 
@@ -474,6 +593,26 @@ func (a *serverApp) handleClientMessage(ctx context.Context, message overvk.Pars
 		overvk.CleanupSessionMetrics(sessionID)
 		log.Printf("[%s] Session terminated by client", sessionID)
 	}
+}
+
+// handleClientReady answers a live handshake from a client that (re)started
+// after the server's one-time bootstrap already completed. Since all clients
+// share the same chats, the peer set is unchanged — the server just needs to
+// re-acknowledge readiness so a new or restarted client can learn the peer IDs
+// without the server being restarted.
+func (a *serverApp) handleClientReady(ctx context.Context, message overvk.ParsedMessage) {
+	if strings.TrimSpace(message.Payload) != a.config.HandshakePhrase {
+		return
+	}
+	peerID := message.PeerID
+	if peerID == 0 {
+		return
+	}
+	if err := overvk.SendControlMessage(ctx, a.httpClient, a.config.Token, peerID, overvk.TargetClient, overvk.MessageReadyACK, "bootstrap", 0, a.config.HandshakePhrase); err != nil {
+		log.Printf("failed to re-acknowledge client readiness for peer_id=%d: %v", peerID, err)
+		return
+	}
+	log.Printf("re-acknowledged client readiness for peer_id=%d (live reconnect)", peerID)
 }
 
 func (a *serverApp) serverWriterTask(ctx context.Context, sessionID string, session *serverSession) {

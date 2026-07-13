@@ -88,8 +88,9 @@ const (
 type ProxyType string
 
 const (
-	ProxySOCKS5 ProxyType = "socks"
-	ProxyHTTP   ProxyType = "http"
+	ProxySOCKS5  ProxyType = "socks"
+	ProxyHTTP    ProxyType = "http"
+	ProxyHybrid  ProxyType = "hybrid"
 )
 
 type Target string
